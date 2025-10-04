@@ -1,10 +1,23 @@
-def ensure_player(players, player_key, name, default_money=20000):
-    if player_key not in players:
-        players[player_key]={"name":name,"seat":None,"ready":False,"money":default_money}
-    else:
-        players[player_key]["name"]=name
-def apply_transfers(players, transfers):
-    if sum(transfers.values())!=0: return False
-    for pid,delta in transfers.items():
-        if pid in players: players[pid]['money']=int(players[pid].get('money',0))+int(delta)
-    return True
+def create_user(users, ip, name):
+    if ip not in users:
+        users[ip] = {"name": name, "coins": 20000}
+
+
+def get_balance(users, ip):
+    if ip not in users:
+        return 0
+    return users[ip]["coins"]
+
+
+def add_coins(users, ip, amount):
+    if ip in users:
+        users[ip]["coins"] += amount
+        if users[ip]["coins"] < 0:
+            users[ip]["coins"] = 0
+
+
+def sync_room_coins(room, users):
+    """同步房间内金币至全局用户"""
+    for ip, pdata in room["players"].items():
+        if ip in users:
+            users[ip]["coins"] = pdata["coins"]
