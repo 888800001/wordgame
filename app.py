@@ -23,7 +23,7 @@ ROOM_TIMEOUT_SEC = 300
 def now_ts(): return time.time()
 def clean_expired_rooms():
     now = now_ts()
-    for rid, room in list(ROOMS()).items():
+    for rid, room in list(ROOMS.items()):
         last = room.get("last_active", room.get("created_at", now))
         if now - last > ROOM_TIMEOUT_SEC:
             del ROOMS()[rid]
