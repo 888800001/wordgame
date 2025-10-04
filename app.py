@@ -1,7 +1,8 @@
 import streamlit as st
 import random, time, uuid
 from utils.room_manager import create_room, get_room, join_room, clean_expired_rooms
-from utils.user_manager import create_user
+from utils.user_manager import create_user, update_balance
+from utils.game_state import GameState
 from games import word, poker, tenhalf
 
 # ========== 页面设置 ==========
