@@ -1,34 +1,49 @@
 # app.py
-# -------------------------------------------------------
-# 字字转机 · 线下桌游“手机裁判 & 卡牌集成器”
-# 玩法：线下抢答；本程序只负责：房间管理、出牌、规则、对决判定、积分与“3秒可中断抢牌”
-# -------------------------------------------------------
-
-import streamlit as st
-import random
+# 字字转机 · 线下桌游裁判/卡牌集成器（多人ID可重进、自动刷新、单按钮轮次、3秒可中断、点击失败者自动结算）
 import time
+import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Literal, Tuple, Dict
+import pandas as pd
+import streamlit as st
 
-# ========== 基础配置 ==========
-st.set_page_config(page_title="字字转机｜线下房间", page_icon="👾", layout="wide")
+# -------------------- 页面设置 & 全局缓存 --------------------
+st.set_page_config(page_title="字字转机｜多人房间", page_icon="👾", layout="wide")
 
-# ========== 全局房间存储（简单内存版） ==========
-# 注意：这是内存存储，适合线下 Demo。若要长期稳定，请换成数据库/后端服务。
 @st.cache_resource
-def get_rooms() -> Dict[str, dict]:
+def ROOMS() -> Dict[str, dict]:
     return {}
 
-ROOMS = get_rooms()
+@st.cache_resource
+def load_categories() -> List[dict]:
+    # 读取 data/categories.csv（两列：category,en）
+    try:
+        df = pd.read_csv("data/categories.csv")
+        df = df.dropna()
+        df = df.iloc[:10000]  # 安全限制
+        return df.to_dict("records")
+    except Exception as e:
+        # 兜底：少量内置名词，便于第一次试跑
+        base = [
+            {"category":"水果","en":"fruit"},
+            {"category":"交通工具","en":"transport"},
+            {"category":"动物","en":"animal"},
+            {"category":"饮料","en":"drink"},
+            {"category":"乐器","en":"instrument"},
+            {"category":"运动","en":"sport"},
+        ]
+        return base
 
-# ========== 数据结构 ==========
-Alien = Literal["狼", "兔", "猫", "牛", "鹰", "象"]  # 可扩展
+CATEGORIES = load_categories()
+
+# -------------------- 数据结构 --------------------
+Role = str  # 角色自由文本
 CardType = Literal["CATEGORY", "RULE"]
 
 @dataclass
 class CategoryCard:
     type: CardType
-    alien: Alien
+    role: Role
     category_cn: str
     category_en: str
 
@@ -36,91 +51,91 @@ class CategoryCard:
 class RuleCard:
     type: CardType
     rule_name: str
-    # 规则：("PAIR_FORCE_DUEL", ("狼","兔")) 表示狼&兔也必须对决；None 表示仅同外星人
-    payload: Optional[Tuple[str, Optional[Tuple[Alien, Alien]]]] = None
+    payload: Optional[Tuple[str, Optional[Tuple[Role, Role]]]] = None
+    # 例：("SAME_ROLE", None) 仅同角色决斗（默认）
+    # 或：("PAIR_FORCE", ("孙行者","者行孙")) 指定不同角色也触发
 
 @dataclass
 class PlayerState:
-    uid: str           # 唯一 id（本地会话生成）
+    player_key: str
     name: str
-    seat: Optional[int] = None       # 座位（顺时针次序）
+    seat: Optional[int] = None
     ready: bool = False
-    pile: List[CategoryCard] = field(default_factory=list)     # 桌面叠（只看顶牌）
-    score_cards: List[CategoryCard] = field(default_factory=list)  # 赢到的记分牌
-    score_grab: int = 0   # “3秒抢牌”额外积分（每抢一张+1）
+    pile: List[CategoryCard] = field(default_factory=list)
+    score_cards: List[CategoryCard] = field(default_factory=list)
+    score_grab: int = 0  # 抢牌加分
 
-# ========== 卡组 & 词汇 ==========
-ALIENS: List[Alien] = ["狼", "兔", "猫", "牛", "鹰", "象"]
+# -------------------- 工具函数 --------------------
+def build_roles(num_players: int) -> List[Role]:
+    """n人对局，生成 n+1 种“孙行者”变体角色"""
+    base = "孙行者"
+    roles = [base]
+    # 简单轮转变形：者行孙、行者孙、…
+    for i in range(1, num_players+1):
+        r = base[-i:] + base[:-i]
+        roles.append(r)
+    # 去重，保证 n+1 个
+    uniq = []
+    for r in roles:
+        if r not in uniq:
+            uniq.append(r)
+    return uniq[:num_players+1]
 
-CATEGORY_POOL = [
-    ("水果", "Fruit"),
-    ("交通工具", "Transport"),
-    ("童话人物", "Fairy Tale Character"),
-    ("垃圾食品", "Junk Food"),
-    ("动物", "Animal"),
-    ("乐器", "Instrument"),
-    ("文具", "Stationery"),
-    ("运动项目", "Sport"),
-]
+def random_category() -> Tuple[str, str]:
+    c = random.choice(CATEGORIES)
+    return c["category"], c["en"]
 
-def build_deck() -> List:
-    deck: List = []
-    for alien in ALIENS:
-        for cn, en in CATEGORY_POOL:
-            deck.append(CategoryCard(type="CATEGORY", alien=alien, category_cn=cn, category_en=en))
-    rule_cards: List[RuleCard] = [
-        RuleCard(type="RULE", rule_name="仅同外星人对决", payload=("SAME_ALIEN_ONLY", None)),
-        RuleCard(type="RULE", rule_name="狼&兔也必须对决", payload=("PAIR_FORCE_DUEL", ("狼", "兔"))),
-        RuleCard(type="RULE", rule_name="猫&牛也必须对决", payload=("PAIR_FORCE_DUEL", ("猫", "牛"))),
-        RuleCard(type="RULE", rule_name="鹰&象也必须对决", payload=("PAIR_FORCE_DUEL", ("鹰", "象"))),
-    ]
-    deck.extend(rule_cards)
+def should_duel(a: Optional[CategoryCard], b: Optional[CategoryCard], active_rule: RuleCard) -> bool:
+    if not a or not b: return False
+    tag, pair = active_rule.payload if active_rule.payload else ("SAME_ROLE", None)
+    if tag == "SAME_ROLE":
+        return a.role == b.role
+    if tag == "PAIR_FORCE" and pair:
+        same = (a.role == b.role)
+        forced = set(pair) == set([a.role, b.role])
+        return same or forced
+    return a.role == b.role
+
+def gen_rule_cards(roles: List[Role]) -> List[RuleCard]:
+    rules = [RuleCard(type="RULE", rule_name="仅同角色对决", payload=("SAME_ROLE", None))]
+    # 随机制造两对“强制对决”组合
+    if len(roles) >= 3:
+        pairs = set()
+        tries = 0
+        while len(pairs) < 2 and tries < 20:
+            a, b = random.sample(roles, 2)
+            if a != b:
+                pairs.add(tuple(sorted((a, b))))
+            tries += 1
+        for a, b in pairs:
+            rules.append(RuleCard(type="RULE", rule_name=f"{a} & {b} 也必须对决", payload=("PAIR_FORCE", (a, b))))
+    return rules
+
+def build_deck(num_players: int, roles: List[Role]) -> List[dict]:
+    """牌堆规模 24×n；每张普通牌 = 随机role + 随机category；混入规则牌（中心唯一）。"""
+    N = 24 * num_players
+    deck: List[dict] = []
+    for _ in range(N):
+        r = random.choice(roles)
+        cn, en = random_category()
+        deck.append(CategoryCard(type="CATEGORY", role=r, category_cn=cn, category_en=en).__dict__)
+    # 混入规则牌
+    for rc in gen_rule_cards(roles):
+        deck.append(rc.__dict__)
     random.shuffle(deck)
     return deck
 
-# ========== 规则判定 ==========
-def should_duel(card_a: Optional[CategoryCard], card_b: Optional[CategoryCard], active_rule: RuleCard) -> bool:
-    if not card_a or not card_b: return False
-    tag, pair = active_rule.payload if active_rule.payload else ("SAME_ALIEN_ONLY", None)
-    if tag == "SAME_ALIEN_ONLY":
-        return card_a.alien == card_b.alien
-    if tag == "PAIR_FORCE_DUEL" and pair:
-        same = (card_a.alien == card_b.alien)
-        forced = set(pair) == set([card_a.alien, card_b.alien])
-        return same or forced
-    return card_a.alien == card_b.alien
-
-# ========== 工具 ==========
-def gen_uid() -> str:
-    return f"u{random.randint(100000, 999999)}"
-
-def init_room(room_id: str, host_uid: str, host_name: str, max_players: int):
-    ROOMS[room_id] = {
-        "room_id": room_id,
-        "host_uid": host_uid,
-        "max_players": max_players,
-        "players": {host_uid: PlayerState(uid=host_uid, name=host_name).__dict__},
-        "stage": "lobby",   # lobby -> playing -> ended
-        "deck": [],
-        "active_rule": RuleCard(type="RULE", rule_name="仅同外星人对决", payload=("SAME_ALIEN_ONLY", None)).__dict__,
-        "turn_idx": 0,     # 指向「seat 排序」的索引
-        "duel": None,      # {"a": uid, "b": uid, "buffer": [cards...]}
-        "countdown": None, # {"ends_at": ts, "reason": "flip/duel/tie"}
-        "last_action_ts": time.time(),
-    }
-
-def get_player_order(room) -> List[str]:
-    # 返回按 seat 从小到大的 uid 列表（仅已选座位的玩家）
-    seated = [(p["seat"], uid) for uid, p in room["players"].items() if p["seat"] is not None]
+def player_order(room) -> List[str]:
+    seated = [(p["seat"], k) for k, p in room["players"].items() if p["seat"] is not None]
     seated.sort(key=lambda x: x[0])
-    return [uid for _, uid in seated]
+    return [k for _, k in seated]
 
-def top_card_of(room, uid: str) -> Optional[CategoryCard]:
-    p = room["players"][uid]
-    return p["pile"][-1] if p["pile"] else None
+def top_card(room, key: str) -> Optional[CategoryCard]:
+    p = room["players"][key]
+    return CategoryCard(**p["pile"][-1]) if p["pile"] else None
 
 def set_countdown(room, seconds: int, reason: str):
-    room["countdown"] = {"ends_at": time.time() + seconds, "reason": reason}
+    room["countdown"] = {"ends_at": time.time() + seconds, "reason": reason, "no_duel_pressed": False}
 
 def in_countdown(room) -> bool:
     cd = room.get("countdown")
@@ -129,149 +144,163 @@ def in_countdown(room) -> bool:
 def cancel_countdown(room):
     room["countdown"] = None
 
-# ========== 房间/玩家 本地状态 ==========
-if "uid" not in st.session_state:
-    st.session_state.uid = gen_uid()
-if "my_room" not in st.session_state:
-    st.session_state.my_room = None   # 当前加入的房间 id
-if "my_name" not in st.session_state:
-    st.session_state.my_name = f"玩家{random.randint(1, 99)}"
+def any_duel_on_board(room) -> Optional[Tuple[str, str]]:
+    """检查场上是否存在触发对决的一对；返回(甲,乙)任意一对玩家key"""
+    order = player_order(room)
+    for i in range(len(order)):
+        for j in range(i + 1, len(order)):
+            a, b = order[i], order[j]
+            if should_duel(top_card(room, a), top_card(room, b), RuleCard(**room["active_rule"])):
+                return a, b
+    return None
 
-# ========== 视图：大厅 ==========
+# -------------------- 本地会话状态 --------------------
+if "player_key" not in st.session_state:
+    st.session_state.player_key = ""     # 你定义的“独一无二ID”
+if "my_room" not in st.session_state:
+    st.session_state.my_room = None      # 当前加入的房间ID
+
+# 自动刷新（1秒）
+st_autorefresh = st.experimental_rerun  # 兼容写法
+st.experimental_set_query_params(ts=int(time.time()))  # 防缓存
+st_autorefresh = st.autorefresh if hasattr(st, "autorefresh") else None
+if st_autorefresh:
+    st_autorefresh(interval=1000, key="tick")
+
+# -------------------- 视图：大厅 --------------------
 def view_lobby():
     st.header("👾 字字转机 · 房间大厅")
+    tabs = st.tabs(["创建房间（房主）", "加入房间（成员）"])
 
-    tab_create, tab_join = st.tabs(["创建房间（房主）", "加入房间（成员）"])
-
-    with tab_create:
+    with tabs[0]:
         st.subheader("创建房间")
-        host_name = st.text_input("我的昵称", value=st.session_state.my_name, key="host_name")
-        room_id = st.text_input("自定义房间号（建议简单如 1234）", value=str(random.randint(1000, 9999)))
-        max_players = st.slider("最大人数上限", 2, 10, 6, 1)
+        room_id = st.text_input("房间号（尽量简单如 1234）", value=str(random.randint(1000, 9999)))
+        player_key = st.text_input("我的独一无二ID（用于掉线重进）", placeholder="如：mc_001")
+        my_name = st.text_input("我的昵称", value="玩家A")
+        max_players = st.slider("最大人数上限", 3, 6, 4)
         if st.button("创建房间"):
-            init_room(room_id, st.session_state.uid, host_name, max_players)
+            if not player_key:
+                st.error("请填写独一无二的ID。")
+                return
+            if room_id in ROOMS():
+                st.error("房间号已存在。")
+                return
+            # 初始化房间
+            roles = build_roles(max_players)
+            ROOMS()[room_id] = {
+                "room_id": room_id,
+                "host_key": player_key,
+                "max_players": max_players,
+                "roles": roles,        # n+1 角色
+                "players": {player_key: PlayerState(player_key=player_key, name=my_name).__dict__},
+                "stage": "lobby",      # lobby / playing
+                "deck": [],
+                "active_rule": RuleCard(type="RULE", rule_name="仅同角色对决", payload=("SAME_ROLE", None)).__dict__,
+                "turn_idx": 0,
+                "duel": None,          # {"a":key,"b":key,"buffer":[cards...]}
+                "countdown": None,     # {"ends_at":ts,"reason":str,"no_duel_pressed":bool}
+            }
+            st.session_state.player_key = player_key
             st.session_state.my_room = room_id
-            st.session_state.my_name = host_name
-            st.success(f"房间已创建：{room_id}，你是房主。")
+            st.success(f"已创建房间 {room_id}，你是房主。")
             st.rerun()
 
-    with tab_join:
+    with tabs[1]:
         st.subheader("加入房间")
-        name = st.text_input("我的昵称", value=st.session_state.my_name, key="join_name")
         room_id = st.text_input("输入房间号")
-        if st.button("加入"):
-            if room_id not in ROOMS:
+        player_key = st.text_input("我的独一无二ID（用于掉线重进）", placeholder="如：mc_002")
+        my_name = st.text_input("我的昵称", value="玩家B")
+        if st.button("加入房间"):
+            if room_id not in ROOMS():
                 st.error("房间不存在。")
+                return
+            room = ROOMS()[room_id]
+            # 如果该ID曾加入过，直接接管；否则新增玩家（不重复）
+            if player_key in room["players"]:
+                room["players"][player_key]["name"] = my_name
             else:
-                room = ROOMS[room_id]
                 if len(room["players"]) >= room["max_players"]:
                     st.error("房间已满。")
-                else:
-                    room["players"][st.session_state.uid] = PlayerState(uid=st.session_state.uid, name=name).__dict__
-                    st.session_state.my_room = room_id
-                    st.session_state.my_name = name
-                    st.success(f"已加入房间：{room_id}")
-                    st.rerun()
+                    return
+                room["players"][player_key] = PlayerState(player_key=player_key, name=my_name).__dict__
+            st.session_state.player_key = player_key
+            st.session_state.my_room = room_id
+            st.success(f"已加入房间 {room_id}")
+            st.rerun()
 
-    st.markdown("---")
-    st.caption("提示：这是共享内存 Demo。要多人同时使用，请把同一个网址分享给朋友，大家各自手机进入同一房间号。")
+    st.caption("说明：每位玩家进入房间时必须填写**独一无二的ID**。掉线/退出后，用同一个ID重进即可接管原座位与积分，不会重复增加玩家。")
 
-# ========== 视图：房间准备 ==========
+# -------------------- 视图：准备阶段 --------------------
 def view_room(room_id: str):
-    if room_id not in ROOMS:
-        st.warning("房间不存在或已被关闭。")
-        if st.button("返回大厅"):
-            st.session_state.my_room = None
+    room = ROOMS().get(room_id)
+    if not room:
+        st.warning("房间不存在或已关闭。")
+        st.session_state.my_room = None
         return
 
-    room = ROOMS[room_id]
-    is_host = (room["host_uid"] == st.session_state.uid)
+    me = room["players"].get(st.session_state.player_key)
+    is_host = (st.session_state.player_key == room["host_key"])
     st.header(f"🛖 房间 {room_id}（上限 {room['max_players']} 人）")
-    st.write(f"当前阶段：**{ '准备中' if room['stage']=='lobby' else ('进行中' if room['stage']=='playing' else '已结束') }**")
 
-    # = 名称、座位、准备 =
-    me = room["players"][st.session_state.uid]
-    c1, c2, c3, c4 = st.columns([2,2,2,2])
+    # 自己设置
+    c1, c2, c3 = st.columns([2,2,2])
     with c1:
-        new_name = st.text_input("我的昵称", value=me["name"])
-        if new_name != me["name"]:
-            me["name"] = new_name
-            st.session_state.my_name = new_name
+        new = st.text_input("我的昵称", value=me["name"])
+        if new != me["name"]:
+            me["name"] = new
     with c2:
-        seats = list(range(0, room["max_players"]))
-        seat = st.selectbox("选择座位（顺时针）", seats, index=seats.index(me["seat"]) if me["seat"] in seats else 0)
+        seats = list(range(room["max_players"]))
+        occ = {p["seat"] for k, p in room["players"].items() if k != st.session_state.player_key}
+        default_idx = me["seat"] if me["seat"] in seats else 0
+        seat = st.selectbox("选择座位（顺时针）", seats, index=default_idx)
         if seat != me.get("seat"):
-            # 座位冲突则拒绝
-            occupied = {p["seat"] for uid, p in room["players"].items() if uid != st.session_state.uid}
-            if seat in occupied:
+            if seat in occ:
                 st.error("该座位已被占用。")
             else:
                 me["seat"] = seat
     with c3:
-        if st.toggle("准备/Ready", value=me.get("ready", False)):
-            me["ready"] = True
-        else:
-            me["ready"] = False
-    with c4:
-        if st.button("退出房间"):
-            if is_host and len(room["players"]) > 1:
-                st.error("房主不能直接退出，请移交房主或解散房间。")
-            else:
-                del room["players"][st.session_state.uid]
-                st.session_state.my_room = None
-                st.rerun()
+        me["ready"] = st.toggle("准备 / Ready", value=me.get("ready", False))
 
-    # = 玩家列表 =
+    # 玩家列表
     st.subheader("玩家列表")
-    cols = st.columns(4)
-    for i, (uid, p) in enumerate(room["players"].items()):
-        with cols[i % 4]:
-            st.markdown(f"**{p['name']}**  | 座位：{p['seat']}  | {'✅已准备' if p['ready'] else '⬜未准备'}")
-            if is_host and uid != room["host_uid"]:
-                if st.button(f"踢出：{p['name']}", key=f"kick_{uid}"):
-                    del room["players"][uid]
+    order_view = sorted(room["players"].values(), key=lambda p: (p["seat"] is None, p["seat"]))
+    cols = st.columns(3)
+    for i, p in enumerate(order_view):
+        with cols[i % 3]:
+            st.markdown(f"**{p['name']}** | 座位：{p['seat']} | {'✅已准备' if p['ready'] else '⬜未准备'}")
+            if is_host and p["player_key"] != room["host_key"]:
+                if st.button(f"踢出：{p['name']}", key=f"kick_{p['player_key']}"):
+                    del room["players"][p["player_key"]]
                     st.toast(f"已踢出 {p['name']}")
-                    st.rerun()
 
-    # = 房主设置 =
+    # 房主操作
     if is_host and room["stage"] == "lobby":
         st.markdown("---")
         st.subheader("房主控制")
-        room["max_players"] = st.slider("调整房间上限", 2, 10, room["max_players"], 1)
+        room["max_players"] = st.slider("调整房间上限", 3, 6, room["max_players"])
         all_ready = (len(room["players"]) >= 2) and all(p["ready"] and p["seat"] is not None for p in room["players"].values())
-        st.write(f"当前已就位：{sum(p['seat'] is not None for p in room['players'].values())} / {room['max_players']}")
+        st.write(f"当前人数：{len(room['players'])} / {room['max_players']} ； 已就位：{sum(p['seat'] is not None for p in room['players'].values())}")
         if st.button("开始游戏", disabled=not all_ready):
-            # 初始化牌堆、规则、回合
-            room["deck"] = [c.__dict__ for c in build_deck()]
-            room["active_rule"] = RuleCard(type="RULE", rule_name="仅同外星人对决",
-                                           payload=("SAME_ALIEN_ONLY", None)).__dict__
+            order = player_order(room)
+            n = len(order)
+            room["roles"] = build_roles(n)
+            room["deck"] = build_deck(n, room["roles"])
+            room["active_rule"] = RuleCard(type="RULE", rule_name="仅同角色对决", payload=("SAME_ROLE", None)).__dict__
             room["turn_idx"] = 0
             for p in room["players"].values():
-                p["pile"] = []
-                p["score_cards"] = []
-                p["score_grab"] = 0
+                p["pile"], p["score_cards"], p["score_grab"] = [], [], 0
             room["duel"] = None
             room["stage"] = "playing"
             st.success("游戏开始！")
             st.rerun()
 
-    st.markdown("---")
-    if st.button("刷新"):
-        st.rerun()
-
-# ========== 视图：游戏主界面 ==========
+# -------------------- 视图：游戏阶段 --------------------
 def view_game(room_id: str):
-    room = ROOMS.get(room_id)
-    if not room or room["stage"] != "playing":
-        st.warning("游戏未开始。")
-        if st.button("返回房间"):
-            st.rerun()
-        return
-
-    is_host = (room["host_uid"] == st.session_state.uid)
-    order = get_player_order(room)
-    if not order:
-        st.warning("无人就位。")
+    room = ROOMS()[room_id]
+    me = room["players"][st.session_state.player_key]
+    order = player_order(room)
+    if len(order) < 2:
+        st.warning("人数不足。")
         return
 
     st.header(f"🎮 对局中 · 房间 {room_id}")
@@ -283,187 +312,159 @@ def view_game(room_id: str):
     with mid:
         st.metric("剩余牌数", len(room["deck"]))
     with right:
-        if st.button("🔄 返回准备（房主）", disabled=not is_host):
-            room["stage"] = "lobby"
-            st.rerun()
-
-    # 中心：规则牌区域 + 倒计时
-    st.markdown("---")
-    center = st.container()
-    with center:
         cd = room.get("countdown")
         if cd and cd["ends_at"] > time.time():
-            remaining = max(0, int(cd["ends_at"] - time.time()))
-            st.warning(f"⏱️ 倒计时 {remaining} 秒（原因：{cd['reason']}）——**任意玩家可在倒计时内抢牌**")
+            remain = max(0, int(cd["ends_at"] - time.time()))
+            st.warning(f"⏱️ 倒计时 {remain}s（{cd['reason']}）")
+            # “无决斗”按钮：提前结束倒计时；若实际存在对决，给出提示
+            no_duel = st.button("🙅 无决斗（提前结束倒计时）")
+            if no_duel:
+                room["countdown"]["no_duel_pressed"] = True
+                duel_pair = any_duel_on_board(room)
+                cancel_countdown(room)
+                if duel_pair:
+                    st.error("其实存在【需要决斗】的一对玩家！")
         else:
             room["countdown"] = None
 
-    # 玩家圈布局（简化为行列自适应）
-    st.subheader("玩家圈")
-    cols = st.columns(min(6, len(order)))  # 每行最多 6 个
+    st.markdown("---")
 
-    # 回合指示
-    current_uid = order[room["turn_idx"]] if room["turn_idx"] < len(order) else order[0]
+    # 当前回合归属
+    turn_key = order[room["turn_idx"]] if room["turn_idx"] < len(order) else order[0]
+    my_turn = (turn_key == st.session_state.player_key) and (room["duel"] is None)
 
-    # --- 玩家格子 ---
-    seat_to_col = {}
-    for idx, uid in enumerate(order):
-        p = room["players"][uid]
-        col = cols[idx % len(cols)]
-        seat_to_col[p["seat"]] = col
+    # 玩家圈布局
+    cols = st.columns(min(6, len(order)))
+    k2col = {}
+    for i, k in enumerate(order):
+        k2col[k] = cols[i % len(cols)]
 
-    def draw_one(uid: str):
+    def draw_one(k: str):
         if not room["deck"]:
             st.toast("牌堆用尽。")
             return
         card = room["deck"].pop()
         if card["type"] == "RULE":
             room["active_rule"] = card
-            st.toast(f"🧩 规则更新：{card['rule_name']}")
-            # 翻到规则牌也触发 3 秒倒计时（给人反应/抢牌）
             set_countdown(room, 3, "翻到规则牌")
         else:
-            room["players"][uid]["pile"].append(card)
+            room["players"][k]["pile"].append(card)
             set_countdown(room, 3, "翻出普通牌")
-            # 检查是否与任意玩家触发对决
-            my_top = room["players"][uid]["pile"][-1]
-            for other_uid in order:
-                if other_uid == uid: continue
-                other_top = top_card_of(room, other_uid)
-                if should_duel(CategoryCard(**my_top) if my_top else None,
-                               CategoryCard(**other_top) if other_top else None,
-                               RuleCard(**room["active_rule"])):
-                    # 进入对决
-                    room["duel"] = {
-                        "a": uid,
-                        "b": other_uid,
-                        "buffer": [my_top] + ([other_top] if other_top else [])
-                    }
-                    st.toast(f"⚔️ 对决触发：{room['players'][uid]['name']} vs {room['players'][other_uid]['name']}")
-                    break
-
-        # 轮转回合（若未进入对决）
+        # 翻普通牌后，检查是否出现任意对决
+        if card["type"] == "CATEGORY":
+            pair = any_duel_on_board(room)
+            if pair:
+                a, b = pair
+                room["duel"] = {"a": a, "b": b, "buffer": []}
+                # 将双方当前顶牌加入奖池
+                ta, tb = top_card(room, a), top_card(room, b)
+                if ta: room["duel"]["buffer"].append(ta.__dict__)
+                if tb: room["duel"]["buffer"].append(tb.__dict__)
+        # 未进入对决才轮转
         if room["duel"] is None:
             room["turn_idx"] = (room["turn_idx"] + 1) % len(order)
 
-    # 抢牌（3秒内）
-    def grab_card(target_uid: str, winner_uid: str):
-        if not in_countdown(room):
-            st.toast("倒计时已结束，不能抢。")
-            return
-        pile = room["players"][target_uid]["pile"]
-        if not pile:
-            st.toast("该玩家没有可抢的顶牌。")
-            return
-        card = pile.pop()
-        room["players"][winner_uid]["score_grab"] += 1
-        cancel_countdown(room)
-        st.toast(f"🎯 抢牌成功！{room['players'][winner_uid]['name']} +1 积分（抢走 {room['players'][target_uid]['name']} 的牌）")
-
-    # 判定对决胜者 / 平手
-    def settle_duel_winner(winner_uid: str):
+    def settle_by_loser(loser_key: str):
+        """点击失败者的牌堆 → 自动找到对手为胜者并结算"""
         duel = room["duel"]
         if not duel: return
-        buffer_cards = duel["buffer"][:]  # 奖池
-        # 双方当前叠也清空并计入奖池
-        for u in [duel["a"], duel["b"]]:
-            buffer_cards.extend(room["players"][u]["pile"])
-            room["players"][u]["pile"].clear()
-        # 计分到胜者
-        room["players"][winner_uid]["score_cards"].extend(buffer_cards)
+        if loser_key not in (duel["a"], duel["b"]):
+            st.toast("当前并非该玩家参与的对决。")
+            return
+        winner_key = duel["b"] if loser_key == duel["a"] else duel["a"]
+        buffer_cards = duel["buffer"][:]
+        # 把双方叠顶加入奖池并清空叠
+        for k in (duel["a"], duel["b"]):
+            buffer_cards.extend(room["players"][k]["pile"])
+            room["players"][k]["pile"].clear()
+        # 计分给胜者
+        room["players"][winner_key]["score_cards"].extend(buffer_cards)
         room["duel"] = None
         set_countdown(room, 3, "对决结束")
-        st.toast(f"🏆 {room['players'][winner_uid]['name']} 赢下本次对决（共 {len(buffer_cards)} 张计分牌）")
 
-    def tie_flip_next():
+    def tie_flip_one():
+        """点击中心牌堆 → 平手各翻一张并加入奖池"""
         duel = room["duel"]
         if not duel: return
-        # 双方各再翻一张（可能翻到规则牌，规则立即生效；直到翻到普通牌为止）
-        for u in [duel["a"], duel["b"]]:
+        for k in (duel["a"], duel["b"]):
             while True:
                 if not room["deck"]: break
                 c = room["deck"].pop()
                 if c["type"] == "RULE":
                     room["active_rule"] = c
-                    st.toast(f"✨ 平手期间规则更新：{c['rule_name']}")
                     continue
                 else:
-                    room["players"][u]["pile"].append(c)
+                    room["players"][k]["pile"].append(c)
                     duel["buffer"].append(c)
                     break
         set_countdown(room, 3, "平手各翻一张")
 
-    # === 渲染每位玩家格子（含操作） ===
-    admin_col = st.sidebar
-    admin_col.header("操作控制")
-    if room["duel"]:
-        a_uid, b_uid = room["duel"]["a"], room["duel"]["b"]
-        admin_col.subheader("⚔️ 对决中")
-        c1, c2, c3 = admin_col.columns(3)
-        with c1:
-            if st.button(f"✅ {room['players'][a_uid]['name']} 胜"):
-                settle_duel_winner(a_uid)
-        with c2:
-            if st.button(f"✅ {room['players'][b_uid]['name']} 胜"):
-                settle_duel_winner(b_uid)
-        with c3:
-            if st.button("🤝 同时说出（平手）→ 各翻一张"):
-                tie_flip_next()
+    # 侧栏：抢牌（倒计时内可中断）
+    st.sidebar.header("⏱️ 抢牌（3 秒内任意人可操作）")
+    if in_countdown(room):
+        target_name = st.sidebar.selectbox("被抢者", [room["players"][k]["name"] for k in order], key="grab_t")
+        winner_name = st.sidebar.selectbox("抢到者", [room["players"][k]["name"] for k in order], key="grab_w")
+        name2key = {room["players"][k]["name"]: k for k in order}
+        if st.sidebar.button("🎯 抢牌"):
+            tkey, wkey = name2key[target_name], name2key[winner_name]
+            pile = room["players"][tkey]["pile"]
+            if pile:
+                pile.pop()  # 只拿走顶牌（不进分牌区，只+1 抢牌分）
+                room["players"][wkey]["score_grab"] += 1
+                cancel_countdown(room)
+                st.toast(f"{winner_name} 抢走 {target_name} 顶牌，+1 抢牌分")
+            else:
+                st.toast("该玩家没有可抢的顶牌。")
+    else:
+        st.sidebar.info("当前无倒计时，不能抢牌。")
 
-    admin_col.markdown("---")
-    admin_col.subheader("⏱️ 抢牌（3秒内任意时刻）")
-    target = admin_col.selectbox("被抢牌的玩家", [room["players"][u]["name"] for u in order], index=0, key="grab_target_name")
-    winner = admin_col.selectbox("抢到者", [room["players"][u]["name"] for u in order], index=0, key="grab_winner_name")
-    name_to_uid = {room["players"][u]["name"]: u for u in order}
-    if admin_col.button("🎯 执行抢牌", disabled=not in_countdown(room)):
-        grab_card(name_to_uid[target], name_to_uid[winner])
-        st.rerun()
-
-    # 玩家格子显示
-    for idx, uid in enumerate(order):
-        p = room["players"][uid]
-        col = cols[idx % len(cols)]
-        with col:
-            is_turn = (uid == current_uid and room["duel"] is None)
-            st.markdown(f"### {p['name']} {'🟢' if is_turn else ''}")
-            top = top_card_of(room, uid)
-            if top:
-                st.success(f"顶牌：{top['alien']}｜{top['category_cn']} ({top['category_en']})")
+    # 渲染每位玩家格子
+    for k in order:
+        p = room["players"][k]
+        with k2col[k]:
+            turn_mark = "🟢" if (k == turn_key and room["duel"] is None) else ""
+            st.markdown(f"### {p['name']} {turn_mark}")
+            tc = top_card(room, k)
+            if tc:
+                st.success(f"顶牌：{tc.role}｜{tc.category_cn} ({tc.category_en})")
             else:
                 st.warning("顶牌：无")
-            st.caption(f"桌面叠：{len(p['pile'])} 张  |  计分牌：{len(p['score_cards'])}  | 抢牌分：{p['score_grab']}")
+            st.caption(f"叠：{len(p['pile'])}  |  计分牌：{len(p['score_cards'])}  | 抢牌分：{p['score_grab']}")
 
-            # 回合内允许翻牌（非对决时）
-            if st.button("翻我下一张", disabled=not is_turn, key=f"flip_{uid}"):
-                draw_one(uid)
+            # 仅当前回合所属ID设备可按
+            if st.button("下一张", disabled=not (k == turn_key and room["duel"] is None and st.session_state.player_key == k), key=f"next_{k}"):
+                draw_one(k)
                 st.rerun()
 
-    st.markdown("---")
-    if st.button("刷新"):
-        st.rerun()
+            # 决斗结算：点击失败者的牌堆（仅在他参与对决时可点）
+            if room["duel"] and k in (room["duel"]["a"], room["duel"]["b"]):
+                if st.button("⚔️ 我输了（点我结算）", key=f"lose_{k}"):
+                    settle_by_loser(k)
+                    st.rerun()
 
-# ========== 入口路由 ==========
+    # 中心“平手各翻一张”
+    if room["duel"]:
+        st.markdown("---")
+        if st.button("🃏 中间牌堆：平手各翻一张（追加）"):
+            tie_flip_one()
+            st.rerun()
+
+# -------------------- 路由 --------------------
 def main():
-    # 选择房间/准备/对局
-    if st.session_state.my_room is None:
+    room_id = st.session_state.my_room
+    if not room_id:
         view_lobby()
         return
-
-    room_id = st.session_state.my_room
-    room = ROOMS.get(room_id)
-    if not room:
+    room = ROOMS().get(room_id)
+    if not room or st.session_state.player_key not in room["players"]:
+        # 房间不存在或ID未注册 → 回大厅
         st.session_state.my_room = None
         st.rerun()
         return
-
     if room["stage"] == "lobby":
         view_room(room_id)
-    elif room["stage"] == "playing":
-        view_game(room_id)
     else:
-        st.header("对局已结束")
-        if st.button("返回大厅"):
-            st.session_state.my_room = None
+        view_game(room_id)
 
 if __name__ == "__main__":
     main()
